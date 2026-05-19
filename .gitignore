@@ -1,0 +1,31 @@
+# API keys and secrets
+.env
+
+# Generated outputs
+outputs/
+
+# Model checkpoints (large binary files)
+OpenWorldSAM-main/checkpoints/
+
+# Datasets (large, not needed for inference)
+OpenWorldSAM-main/datasets/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
