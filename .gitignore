@@ -4,6 +4,9 @@
 # Generated outputs
 outputs/
 
+# checkpoints
+checkpoints/
+
 # Model checkpoints (large binary files)
 OpenWorldSAM-main/checkpoints/
 

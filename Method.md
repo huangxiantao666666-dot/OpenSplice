@@ -1,194 +1,116 @@
-# Method: Vision-Language Driven Image Stitching Agent
+# Method: Interactive Segmentation + Poisson Blending + AI Harmonization
 
 ## Overview
 
-An **image editing agent powered by vision-language models** that accepts natural language instructions. The agent understands the user's intent, locates target regions via open-vocabulary segmentation, generates replacement content, seamlessly blends it into the original image, and optionally harmonizes in-place — all without manual mask drawing or parameter tuning.
+OpenSplice provides an **interactive web UI** for object replacement in images. The user segments a target object with SAM 3 (using text, box, or point prompts), provides a replacement image (uploaded or AI-generated), and the system blends it in — with an optional AI harmonization step that fixes lighting, seams, and scale mismatches.
 
-**Core insight**: Chaining open-vocabulary segmentation, text-to-image generation, and instruction-based image editing into a closed-loop feedback system, with a vision model acting as both planner and quality inspector.
-
----
-
-## Workflow
-
-```
-User Instruction + Original Image
-      │
-      ▼
-┌──────────────────────────┐
-│ 1. Task Decomposition    │  Qwen Vision (qwen3.6-flash)
-│    Vision LLM sees image │  → JSON task plan
-│    and plans subtasks    │
-└──────┬───────────────────┘
-       │
-       ▼
-┌──────────────────────────┐
-│ 2. Segmentation          │  OpenWorldSAM (NeurIPS 2025)
-│    Referring expression  │  → Binary mask + bbox + score
-│    locates target object │
-└──────┬───────────────────┘
-       │
-       ▼
-┌──────────────────────────┐
-│ 3. Image Generation      │  Z-Image-Turbo (DashScope)
-│    Text-to-image for     │  → 1024×1024 replacement image
-│    replacement content   │
-└──────┬───────────────────┘
-       │
-       ▼
-┌──────────────────────────┐
-│ 4. Stitching             │  cv2.seamlessClone (Poisson)
-│    Resize → Position     │  → Seamless composite image
-│    → Poisson blend       │
-└──────┬───────────────────┘
-       │
-       ▼
-┌──────────────────────────┐
-│ 5. Visual Review         │  Qwen Vision (qwen3.6-flash)
-│    Before/after comparison│  → Score (1-10) + issues
-│    with vision model     │     + approved / rejected
-└──────┬───────────────────┘
-       │
-       ├── Approved ──→ Output final result
-       │
-       └── Rejected
-              │
-              ▼
-       ┌──────────────────────────┐
-       │ 6. Harmonization         │  Qwen-Image-Edit-Plus
-       │    In-place edits on the │  → Harmonized composite
-       │    stitched image        │
-       └──────────┬───────────────┘
-                  │
-                  ▼
-           Re-review → Output final result
-```
-
-**Fixed API call budget**: 3–4 calls per run (decomposition + generation + review + optional harmonization). No retry loops, no regeneration spirals.
+**Core insight**: SAM 3's open-vocabulary segmentation handles arbitrary objects without training; Poisson blending provides gradient-domain seamless insertion; and Qwen-Image-Edit acts as a "fix-it" pass on the rough composite.
 
 ---
 
-## Detailed Methodology
-
-### 1. Task Decomposition
-
-**Model**: Qwen Vision (`qwen3.6-flash`)  
-**Input**: Original image (base64) + user instruction (natural language)  
-**Output**: Structured JSON task plan
-
-```json
-{
-  "steps": [
-    {"step_id": 1, "action": "segment", "target_description": "..."},
-    {"step_id": 2, "action": "generate", "generation_prompt": "..."}
-  ],
-  "final_placement": {
-    "paste_region_step": 1,
-    "source_step": 2,
-    "blend_mode": "poisson"
-  }
-}
-```
-
-**Why a vision model instead of a text-only LLM**: Scene context — object positions, colors, lighting, camera angle — can only be understood by *seeing* the image. A text-only model must guess, leading to inaccurate target descriptions that cause downstream segmentation failures or content mismatches.
-
-The system prompt enforces three rules:
-1. **Look first, then plan** — target descriptions must reference what is actually visible in the image
-2. **Scene-aware generation** — generation prompts must include lighting direction, color temperature, camera angle, and image style
-3. **Valid JSON only** — no markdown fences, no commentary
-
-### 2. Segmentation
-
-**Model**: OpenWorldSAM (`Open-World-SAM2-CrossAttention`)
-
-An extension of SAM2 published at NeurIPS 2025, supporting four modes: instance segmentation, semantic segmentation, panoptic segmentation, and **referring expression segmentation**. We use the referring mode exclusively.
-
-**Input**: Original image + natural language expression (e.g., "a black backpack sitting on the wooden floor near the bottom rungs of the black metal ladder")
-
-**Output**: Binary mask, confidence score, and bounding box:
+## Pipeline
 
 ```
-mask area = 29656 px
-score      = 0.889
-bbox       = (422, 1046, 189, 229)
+1. Segmentation       SAM 3 (text / box / point)
+        │
+2. Replacement        Upload or Qwen-Image-Plus generation
+        │
+3. Object Extraction  Canny edge detection → crop to subject bbox
+        │
+4. Poisson Blend      Resize → place at mask bbox → cv2.seamlessClone
+        │
+5. Harmonization      Qwen-Image-Edit in-place fix (optional)
 ```
 
-**Advantage over alternatives**: No predefined categories needed. No bounding box or point annotation needed. Any visible object can be located with free-form natural language, including objects not in standard detection datasets.
+---
 
-Environment: PyTorch 2.9 CPU-only. Model loading takes ~17 seconds, single inference takes ~8 seconds.
+## 1. Segmentation — SAM 3
 
-### 3. Image Generation
+**Model**: SAM 3 (`facebook/sam3`, 848M params) with interactive predictor enabled (`enable_inst_interactivity=True`).
 
-**Model**: Z-Image-Turbo (via DashScope Python SDK)
+Three prompt modes:
 
-Uses `dashscope.aigc.image_generation.ImageGeneration.call()` in OpenAI-compatible format. Outputs a 1024×1024 pixel image at a single URL.
+| Mode | Method | Use case |
+|------|--------|----------|
+| **Text** | `Sam3Processor.set_text_prompt()` → grounding boxes → `model.predict_inst()` per box | "a person", "穿红色衣服的人" |
+| **Box** | `model.predict_inst(box=[x1,y1,x2,y2])` | Drag two corners to enclose an object |
+| **Point** | `model.predict_inst(point_coords=..., point_labels=...)` | Click foreground points, multi-mask for single click |
 
-**Design decisions**:
-- Sync call preferred (~4 seconds); falls back to async polling if sync fails
-- Images returned as OSS URLs, downloaded and decoded into BGR numpy arrays
-- Each generation overwrites `last_generated.png` to avoid file accumulation
+Text grounding: SAM 3's `Sam3Processor` detects all instances matching a text concept, returning coarse boxes and masks. Each box is then refined through the interactive predictor (`predict_inst` with box input) to produce high-quality instance masks.
 
-### 4. Stitching (Poisson Blending)
+Box and point: go directly through the interactive predictor, which is SAM 1-style point/box → mask inference.
 
-**Method**: Poisson image editing (`cv2.seamlessClone`) with adaptive sizing.
+All masks are binary (0/1 uint8), thresholded at 0.5.
+
+**Workaround**: `Sam3Processor.set_image` has a numpy shape bug — for HWC arrays it reads `shape[-2:]` as `(W, C)`. Fixed by converting to PIL Image before passing to the processor.
+
+---
+
+## 2. Replacement Image
+
+Two sources:
+
+- **Upload**: User-provided image file, loaded via `cv2.imread` → converted to RGB
+- **Generate**: Qwen-Image-Plus text-to-image via DashScope SDK (`dashscope.aigc.image_generation.ImageGeneration.call()`)
+
+Both are normalized to RGB internally. Generated images are 1024×1024.
+
+---
+
+## 3. Object Extraction — `crop_to_object()`
+
+AI-generated images include background around the subject. Before blending, the subject must be isolated.
+
+**Algorithm** (pure OpenCV, no extra AI calls):
+
+1. Convert to grayscale
+2. Canny edge detection (thresholds 30/100)
+3. Morphological close (elliptical 7×7 kernel, 2 iterations) to connect edge fragments
+4. Find external contours
+5. Filter contours near the image center (within 40% of max dimension) — assumes subject is centered
+6. Compute combined bounding box of all valid contours + 8px padding
+7. Crop
+
+This removes the background ring around AI-generated subjects in milliseconds.
+
+---
+
+## 4. Poisson Blending — `poisson_blend()`
+
+**Method**: `cv2.seamlessClone` with `NORMAL_CLONE` mode.
 
 **Steps**:
-1. Compute bounding box `(x, y, w, h)` from the segmentation mask
-2. Center-crop the 1024×1024 generated image to match the bbox aspect ratio
-3. Resize the cropped result to exactly `(w, h)`
-4. Place the resized foreground onto a full-size canvas at the bbox position
-5. Create a rectangular mask matching the bbox area
-6. Apply `cv2.seamlessClone` for gradient-domain blending
 
-**Why a rectangular mask instead of the precise segmentation mask**: The generated object (e.g., Peppa Pig) rarely matches the exact silhouette of the original object being replaced (e.g., a dog). Using the precise mask would crop through the generated content in unpredictable ways. A rectangular mask preserves the full generated content and lets Poisson blending naturally smooth the edges within the bbox region.
+1. Compute mask bounding box `(x, y, w, h)` from the SAM 3 mask
+2. Resize the replacement to `(w, h)`
+3. Place onto a full-size canvas at the bbox position
+4. Apply Gaussian blur to the mask (kernel size 5) for edge softening
+5. Threshold blurred mask at 0.5 → multiply by 255 to get uint8 mask in [0, 255]
+6. Call `cv2.seamlessClone(fg_full, background, mask_uint8, center, NORMAL_CLONE)`
 
-Three blending modes are supported:
-- `NORMAL_CLONE` (default): Preserves foreground texture, transfers background gradient
-- `MIXED_CLONE`: Mixes source and destination gradients
-- `MONOCHROME_TRANSFER`: Transfers only color and lighting (not texture)
+**`NORMAL_CLONE` vs `MIXED_CLONE`**: `NORMAL_CLONE` preserves the source (foreground) texture while smoothly adapting to the destination (background) gradient at the mask boundary. `MIXED_CLONE` blends gradients from both, which creates an "averaged" look — not what we want for object insertion.
 
-### 5. Visual Review
+**Mask format note**: SAM 3 masks are binary (0/1). The threshold is `> 0.5` (not `> 128`) because the blur operates on float32 values in [0, 1].
 
-**Model**: Qwen Vision (`qwen3.6-flash`)
+**Fallback**: If `seamlessClone` raises an error (e.g., mask region too small), falls back to alpha blending with Gaussian feathering (`_alpha_blend`).
 
-The original image and the stitched composite are sent side-by-side to the vision model. It acts as a quality inspector, evaluating:
+---
 
-- **Lighting consistency** — does the pasted object match the scene's illumination?
-- **Shadow plausibility** — are there realistic contact shadows?
-- **Edge quality** — are there halos, artifacts, or cutout effects?
-- **Perspective matching** — does the object's angle match the camera viewpoint?
-- **Object correctness** — is the generated content what the user actually asked for?
+## 5. AI Harmonization — `harmonize_image()`
 
-Output:
-```json
-{
-  "approved": false,
-  "score": 4,
-  "issues": [
-    "Poor blending: object looks like a flat 2D sticker",
-    "Incorrect lighting: character is brightly lit while scene uses flash"
-  ],
-  "feedback": "The edit correctly identifies the target, but execution is poor...",
-  "new_generation_prompt": "..."
-}
-```
+**Model**: Qwen-Image-Edit-Max (DashScope `MultiModalConversation` API)
 
-### 6. Harmonization
+The Fast Stitch (Poisson blend) result is a rough composite — edges may be visible, lighting may mismatch, scale may look wrong. Harmonization sends this composite to the image editing model with instructions to:
 
-**Model**: Qwen-Image-Edit-Plus (DashScope `MultiModalConversation` API)
+1. Fix lighting and shadows to match the scene
+2. Blend edges seamlessly (no visible seams or halos)
+3. Match color tone and white balance to the background
+4. Adjust scale and perspective if the object looks disproportionate
+5. **Keep the background and non-pasted regions identical**
 
-When the visual review rejects the result, instead of regenerating from scratch (which changes object shape and position), we perform **in-place editing** on the stitched composite.
+The stitched image is sent as base64 PNG alongside the text prompt. The model returns an edited image where only the pasted region and its immediate surroundings are adjusted.
 
-The stitched image (base64) + a repair instruction are sent to the image editing model, which attempts to fix:
-- Lighting mismatches
-- Missing or incorrect shadows
-- Edge halos and artifacts
-- Color inconsistencies
-
-**Why this replaces multi-retry loops**:
-- Local fixes preserve object position and shape
-- The editing model sees the full context and makes context-aware adjustments
-- Exactly 1 extra API call, not an unpredictable N-retry loop
-- The harmonized result is reviewed once more, then always accepted
+**API call budget**: 1 call per harmonization. 120-second timeout. No retry loops.
 
 ---
 
@@ -196,21 +118,21 @@ The stitched image (base64) + a repair instruction are sent to the image editing
 
 | Choice | Rationale |
 |--------|-----------|
-| LangGraph StateGraph | Multi-node pipeline with conditional routing and feedback loops is cleaner as a graph than nested if-else chains |
-| Qwen ecosystem (Vision + Image + Edit) | Single DashScope API key, no VPN needed for Chinese users, consistent SDK |
-| OpenWorldSAM | State-of-the-art open-vocabulary segmentation with referring expression support; open-source |
-| Poisson blending | Smoother than direct pixel copy, faster than deep inpainting, offline-capable |
-| Single-pass harmonization | More cost-effective than multi-round generation retries; more predictable results |
-| CPU inference | User's hardware constraint; acceptable for prototype (17s + 8s per image) |
+| SAM 3 | State-of-the-art open-vocabulary segmentation; supports text, box, and point prompts; Chinese + English |
+| Poisson blending | Gradient-domain blending is smoother than alpha blending, faster than deep inpainting, offline-capable |
+| `NORMAL_CLONE` | Preserves replacement texture while adapting to background lighting |
+| Canny edge detection for object extraction | Fast (milliseconds), no extra AI call, works for centered subjects |
+| Qwen-Image-Edit for harmonization | In-place editing preserves object position/shape; 1 call vs unpredictable retry loops |
+| Gradio Web UI | Interactive prompt adjustments; immediate visual feedback; webcam support |
+| Single DashScope API key | One provider for generation + editing; no VPN needed for Chinese users |
 
 ---
 
 ## Known Limitations
 
-1. **Generation quality for rare objects**: Z-Image-Turbo struggles with uncommon objects (mortar weapons, atomic bombs), often producing indistinct shapes or lexical ambiguities (mortar → kitchen tool)
-2. **Content safety filters**: Military/sensitive terms are blocked by DashScope content moderation
-3. **Harmonization may over-correct**: Qwen-Image-Edit can alter the entire image rather than just the pasted region
-4. **Fixed output resolution**: Z-Image-Turbo outputs 1024×1024 only; cropping/upscaling needed for high-res originals
-5. **CPU inference latency**: OpenWorldSAM loads in ~17s and infers in ~8s on CPU; not suitable for real-time use
-6. **No interactive refinement**: Currently a single-shot pipeline; no support for "move it a bit to the left" style iterative feedback
-7. **Merge conflicts with original objects**: If the generated object and original background content both appear around the mask boundary, seam artifacts may persist
+1. **Generation quality**: AI-generated replacements may differ in style, lighting, or proportion from the original scene
+2. **Content safety filters**: Sensitive terms are blocked by DashScope content moderation
+3. **CPU inference latency**: SAM 3 loads in ~45s and infers in ~5-10s on CPU
+4. **Single-shot harmonization**: No iterative refinement; if the first harmonization doesn't look right, re-run manually
+5. **crop_to_object edge cases**: If the replacement subject is off-center or has a complex background, edge detection may include background in the crop
+6. **Mask-dependent quality**: The final blend is only as good as the SAM 3 mask; inaccurate masks produce visible artifacts at the boundary
