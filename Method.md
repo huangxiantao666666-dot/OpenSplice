@@ -1,116 +1,187 @@
-# Method: Interactive Segmentation + Poisson Blending + AI Harmonization
+# Method: Two Workflows for Object Insertion
 
 ## Overview
 
-OpenSplice provides an **interactive web UI** for object replacement in images. The user segments a target object with SAM 3 (using text, box, or point prompts), provides a replacement image (uploaded or AI-generated), and the system blends it in — with an optional AI harmonization step that fixes lighting, seams, and scale mismatches.
+OpenSplice provides **two complementary workflows** in a tabbed Gradio UI:
 
-**Core insight**: SAM 3's open-vocabulary segmentation handles arbitrary objects without training; Poisson blending provides gradient-domain seamless insertion; and Qwen-Image-Edit acts as a "fix-it" pass on the rough composite.
+**Tab 1 — Interactive Placement**: Free-form drag, rotate, and scale the foreground anywhere on the background. Best for creative placement where the user wants full control.
 
----
+**Tab 2 — SAM3 Stitch**: Segment a specific object in the background, then replace it with another. Best for targeted object replacement (e.g., swap a face, replace a product).
 
-## Pipeline
-
-```
-1. Segmentation       SAM 3 (text / box / point)
-        │
-2. Replacement        Upload or Qwen-Image-Plus generation
-        │
-3. Object Extraction  Canny edge detection → crop to subject bbox
-        │
-4. Poisson Blend      Resize → place at mask bbox → cv2.seamlessClone
-        │
-5. Harmonization      Qwen-Image-Edit in-place fix (optional)
-```
+Both share the same core blending and harmonization modules.
 
 ---
 
-## 1. Segmentation — SAM 3
+## Tab 1: Interactive Placement
 
-**Model**: SAM 3 (`facebook/sam3`, 848M params) with interactive predictor enabled (`enable_inst_interactivity=True`).
+```
+Background Upload           Foreground Upload / AI Generate
+        │                              │
+        │                     SAM3 center-point auto-segment
+        │                         → largest mask = object
+        │                              │
+        └──────────┬───────────────────┘
+                   │
+            Live Preview
+        (click to set position,
+         sliders for rotation & scale)
+                   │
+    ┌──────────────┼──────────────┐
+    ▼              ▼              ▼
+Alpha Blend   Poisson Blend   AI Harmonize
+(cut-paste)   (seamlessClone)  (DashScope)
+                   │
+          ┌────────┴────────┐
+          ▼                 ▼
+    Reinhard Color      simOPA Score
+    Transfer            (0–1 rating)
+```
+
+### Auto-Segmentation of Foreground
+
+When a foreground image is uploaded or generated:
+
+1. Create a `Segmenter` instance for the foreground
+2. Call `segment_by_point([[cx, cy]], [1])` with the image center — `multimask=True` gives 3 candidates
+3. Select the mask with the largest area (`mask.sum()`)
+4. Use this mask to isolate the foreground object from its background
+
+### Transform Pipeline — `transforms.py`
+
+**Rotation + Scaling** (`apply_transform`):
+- Use `cv2.getRotationMatrix2D` around the image center
+- Auto-expand the output canvas (accounting for `cos`/`sin` of rotation angle) so no clipping occurs
+- Apply `cv2.warpAffine` with `INTER_CUBIC` for the image, `INTER_LINEAR` for the mask
+- Mask is scaled ×255 before interpolation, thresholded at 128 after (handles binary mask correctly)
+
+**Live Preview** (`render_overlay`):
+- Transform the foreground + mask
+- Alpha-composite onto the background at the user-chosen center position
+- Clip to background bounds (partial off-screen rendering supported)
+
+### Alpha Blend — `alpha_place()`
+
+The simplest form of compositing:
+
+```
+result = foreground × mask + background × (1 − mask)
+```
+
+Direct pixel replacement where mask > 0. Fastest option. No gradient blending — sharp edges between foreground and background.
+
+### Poisson Blend — `place_and_blend()`
+
+Calls `cv2.seamlessClone` with `NORMAL_CLONE`:
+
+1. Transform foreground and mask (rotation + scale)
+2. Place onto a full-size canvas at the chosen position
+3. Gaussian-blur the mask edges (kernel size 5)
+4. Threshold at 128 (mask is 0-255 after ×255 step)
+5. `cv2.seamlessClone(fg_full, background, mask_uint8, center, NORMAL_CLONE)`
+
+`NORMAL_CLONE` preserves the foreground texture while adapting gradients at the mask boundary to match the background. Falls back to alpha compositing on error.
+
+---
+
+## Tab 2: SAM3 Stitch
+
+```
+Upload Image
+      │
+SAM 3 Segmentation (text / box / point)
+      │
+Select Mask → Upload or Generate Replacement
+      │
+crop_to_object() → remove background from replacement
+      │
+resize_and_crop_to_mask() → match aspect ratio
+      │
+poisson_blend() → seamlessClone at mask bbox
+      │
+      ├── Fast Stitch (done)
+      └── AI Harmonize (DashScope fix-up)
+```
+
+### Segmentation — SAM 3
 
 Three prompt modes:
 
-| Mode | Method | Use case |
-|------|--------|----------|
-| **Text** | `Sam3Processor.set_text_prompt()` → grounding boxes → `model.predict_inst()` per box | "a person", "穿红色衣服的人" |
-| **Box** | `model.predict_inst(box=[x1,y1,x2,y2])` | Drag two corners to enclose an object |
-| **Point** | `model.predict_inst(point_coords=..., point_labels=...)` | Click foreground points, multi-mask for single click |
+| Mode | API | Note |
+|------|-----|------|
+| **Text** | `Sam3Processor.set_text_prompt()` → ground → `predict_inst()` per box | Open-vocabulary, Chinese + English |
+| **Box** | `model.predict_inst(box=[x1,y1,x2,y2])` | Click two corners |
+| **Point** | `model.predict_inst(point_coords=..., point_labels=...)` | Click foreground points |
 
-Text grounding: SAM 3's `Sam3Processor` detects all instances matching a text concept, returning coarse boxes and masks. Each box is then refined through the interactive predictor (`predict_inst` with box input) to produce high-quality instance masks.
+Text grounding: detects all instances matching a concept, returns coarse boxes. Each box is refined through `predict_inst` for a high-quality mask.
 
-Box and point: go directly through the interactive predictor, which is SAM 1-style point/box → mask inference.
+### Object Extraction — `crop_to_object()`
 
-All masks are binary (0/1 uint8), thresholded at 0.5.
+AI-generated images include background. The algorithm (pure OpenCV):
 
-**Workaround**: `Sam3Processor.set_image` has a numpy shape bug — for HWC arrays it reads `shape[-2:]` as `(W, C)`. Fixed by converting to PIL Image before passing to the processor.
+1. Canny edge detection (30/100)
+2. Morphological close (7×7 elliptical kernel, 2 iterations)
+3. Find external contours, filter near image center (within 40% of longest dimension)
+4. Combined bounding box + 8px padding → crop
 
----
+Fast (~milliseconds), no extra inference cost.
 
-## 2. Replacement Image
+### Poisson Blend — `poisson_blend()`
 
-Two sources:
+1. Compute mask bounding box → resize replacement to match
+2. Place onto full-size canvas at bbox position
+3. Gaussian-blur mask edges → threshold → `cv2.seamlessClone`
 
-- **Upload**: User-provided image file, loaded via `cv2.imread` → converted to RGB
-- **Generate**: Qwen-Image-Plus text-to-image via DashScope SDK (`dashscope.aigc.image_generation.ImageGeneration.call()`)
-
-Both are normalized to RGB internally. Generated images are 1024×1024.
-
----
-
-## 3. Object Extraction — `crop_to_object()`
-
-AI-generated images include background around the subject. Before blending, the subject must be isolated.
-
-**Algorithm** (pure OpenCV, no extra AI calls):
-
-1. Convert to grayscale
-2. Canny edge detection (thresholds 30/100)
-3. Morphological close (elliptical 7×7 kernel, 2 iterations) to connect edge fragments
-4. Find external contours
-5. Filter contours near the image center (within 40% of max dimension) — assumes subject is centered
-6. Compute combined bounding box of all valid contours + 8px padding
-7. Crop
-
-This removes the background ring around AI-generated subjects in milliseconds.
+Uses the precise mask contour so only the object region is modified.
 
 ---
 
-## 4. Poisson Blending — `poisson_blend()`
+## Shared Modules
 
-**Method**: `cv2.seamlessClone` with `NORMAL_CLONE` mode.
+### AI Harmonization — `harmonize_image()`
 
-**Steps**:
+Both tabs can call Qwen-Image-Edit-Max to fix rough composites:
 
-1. Compute mask bounding box `(x, y, w, h)` from the SAM 3 mask
-2. Resize the replacement to `(w, h)`
-3. Place onto a full-size canvas at the bbox position
-4. Apply Gaussian blur to the mask (kernel size 5) for edge softening
-5. Threshold blurred mask at 0.5 → multiply by 255 to get uint8 mask in [0, 255]
-6. Call `cv2.seamlessClone(fg_full, background, mask_uint8, center, NORMAL_CLONE)`
+1. Encode the stitched image as base64 PNG
+2. Send to DashScope `MultiModalConversation` API with instructions to fix lighting, shadows, edges, color, and perspective
+3. Download the edited result
 
-**`NORMAL_CLONE` vs `MIXED_CLONE`**: `NORMAL_CLONE` preserves the source (foreground) texture while smoothly adapting to the destination (background) gradient at the mask boundary. `MIXED_CLONE` blends gradients from both, which creates an "averaged" look — not what we want for object insertion.
+120-second timeout. Single API call per harmonization.
 
-**Mask format note**: SAM 3 masks are binary (0/1). The threshold is `> 0.5` (not `> 128`) because the blur operates on float32 values in [0, 1].
+### Reinhard Color Transfer
 
-**Fallback**: If `seamlessClone` raises an error (e.g., mask region too small), falls back to alpha blending with Gaussian feathering (`_alpha_blend`).
+Classic algorithm (Reinhard et al., IEEE CG&A 2001), implemented in `libcom_utils.py`:
+
+1. Convert both foreground and background to CIE Lab color space
+2. Compute mean and standard deviation for each Lab channel
+3. Linearly transform foreground pixels: `(fg − μ_fg) × (σ_bg / σ_fg) + μ_bg`
+4. Convert back to RGB
+
+Zero dependencies beyond NumPy + OpenCV. Always available, no API call needed.
+
+### simOPA Composition Scoring — `opa_scorer.py`
+
+Self-contained Object Placement Assessment model from BCMI Lab:
+
+| Component | Detail |
+|-----------|--------|
+| Architecture | 4-channel ResNet18 → GAP → Linear(512, 2) |
+| Input | Composite image + mask, concatenated to 4 channels, resized to 256×256 |
+| Output | Softmax probability of class 1 ("reasonable placement") |
+| Weight | `checkpoints/simopa.pth` (~45 MB) |
+| Device | CPU (no GPU required) |
+
+No dependency on libcom — model code is extracted directly from the OPA project source.
 
 ---
 
-## 5. AI Harmonization — `harmonize_image()`
+## Blending Modes Comparison
 
-**Model**: Qwen-Image-Edit-Max (DashScope `MultiModalConversation` API)
-
-The Fast Stitch (Poisson blend) result is a rough composite — edges may be visible, lighting may mismatch, scale may look wrong. Harmonization sends this composite to the image editing model with instructions to:
-
-1. Fix lighting and shadows to match the scene
-2. Blend edges seamlessly (no visible seams or halos)
-3. Match color tone and white balance to the background
-4. Adjust scale and perspective if the object looks disproportionate
-5. **Keep the background and non-pasted regions identical**
-
-The stitched image is sent as base64 PNG alongside the text prompt. The model returns an edited image where only the pasted region and its immediate surroundings are adjusted.
-
-**API call budget**: 1 call per harmonization. 120-second timeout. No retry loops.
+| Mode | Speed | Edge Quality | Color Fidelity | API Call |
+|------|-------|-------------|----------------|----------|
+| Alpha Blend | Instant | Hard edges | Full foreground colors | No |
+| Poisson (NORMAL_CLONE) | Fast | Smooth, gradient-matched | Adapted to background | No |
+| Poisson + AI Harmonize | ~30s | Seamless | Re-lit, re-colored | Yes |
+| + Reinhard Color Transfer | Fast | Same as blend mode | Foreground matched to bg stats | No |
 
 ---
 
@@ -118,21 +189,21 @@ The stitched image is sent as base64 PNG alongside the text prompt. The model re
 
 | Choice | Rationale |
 |--------|-----------|
-| SAM 3 | State-of-the-art open-vocabulary segmentation; supports text, box, and point prompts; Chinese + English |
-| Poisson blending | Gradient-domain blending is smoother than alpha blending, faster than deep inpainting, offline-capable |
-| `NORMAL_CLONE` | Preserves replacement texture while adapting to background lighting |
-| Canny edge detection for object extraction | Fast (milliseconds), no extra AI call, works for centered subjects |
-| Qwen-Image-Edit for harmonization | In-place editing preserves object position/shape; 1 call vs unpredictable retry loops |
-| Gradio Web UI | Interactive prompt adjustments; immediate visual feedback; webcam support |
-| Single DashScope API key | One provider for generation + editing; no VPN needed for Chinese users |
+| Two tabs | Different use cases: creative placement vs targeted replacement |
+| Separate state per tab (`_s1` / `_s2`) | Independent workflows, no cross-contamination |
+| SAM3 for foreground auto-segmentation | Center point is heuristic; SAM3 makes it reliable |
+| `cv2.warpAffine` for rotation/scale | Fast, CPU-only, handles mask interpolation correctly |
+| Self-contained simOPA | Avoids libcom's broken import chain; works on CPU |
+| Reinhard color transfer (built-in) | Always available; no API cost; good baseline |
+| Gradio `.queue()` | Background thread execution; API calls don't block UI |
 
 ---
 
 ## Known Limitations
 
-1. **Generation quality**: AI-generated replacements may differ in style, lighting, or proportion from the original scene
-2. **Content safety filters**: Sensitive terms are blocked by DashScope content moderation
-3. **CPU inference latency**: SAM 3 loads in ~45s and infers in ~5-10s on CPU
-4. **Single-shot harmonization**: No iterative refinement; if the first harmonization doesn't look right, re-run manually
-5. **crop_to_object edge cases**: If the replacement subject is off-center or has a complex background, edge detection may include background in the crop
-6. **Mask-dependent quality**: The final blend is only as good as the SAM 3 mask; inaccurate masks produce visible artifacts at the boundary
+1. **SAM3 CPU latency**: ~45s load + ~5-10s per inference. Mitigation: preload at startup
+2. **Single-shot harmonization**: No iterative refinement; re-run manually if needed
+3. **crop_to_object**: Fails on off-center or busy-background foregrounds
+4. **simOPA score interpretation**: Trained on OPA dataset; scores are relative, not absolute
+5. **DashScope content filters**: Sensitive terms blocked; API quota may be limited
+6. **No undo**: Each blend overwrites `_s1["blend_result"]`; save intermediate results manually

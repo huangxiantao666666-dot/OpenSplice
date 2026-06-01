@@ -1,6 +1,6 @@
 # OpenSplice — AI Image Stitching
 
-Interactive web UI for object replacement in images. Segment with SAM 3 (text / box / point), provide a replacement image (upload or AI-generated), and blend it in seamlessly — with optional AI harmonization.
+Interactive web UI for object replacement in images. Two workflows: **free-form interactive placement** (drag, rotate, scale, blend) and **SAM 3 mask-based stitching** (segment → replace → stitch).
 
 ```
 python -m image_stitch_agent.app
@@ -13,7 +13,7 @@ Also includes a standalone SAM 3 segmentation demo:
 python sam3_demo.py
 ```
 
-Powered by [SAM 3](https://github.com/facebookresearch/sam3) (segmentation), [Qwen-Image-Plus](https://help.aliyun.com/zh/model-studio/) (generation), and [Qwen-Image-Edit](https://help.aliyun.com/zh/model-studio/qwen-image-edit-guide) (harmonization).
+Powered by [SAM 3](https://github.com/facebookresearch/sam3) (segmentation), [Qwen-Image-Plus](https://help.aliyun.com/zh/model-studio/) (generation), [Qwen-Image-Edit](https://help.aliyun.com/zh/model-studio/qwen-image-edit-guide) (harmonization), [simOPA](https://github.com/bcmi/Object-Placement-Assessment) (scoring), and [Reinhard Color Transfer](https://doi.org/10.1109/38.946629) (color matching).
 
 ---
 
@@ -45,7 +45,7 @@ pip install -r requirements_agent.txt
 
 ### 4. Download SAM 3 checkpoint
 
-The SAM 3 model checkpoint (`sam3.pt`) is **required** and **not included** in the repo.
+The SAM 3 model checkpoint (`sam3.pt`) is **required** (~3.4 GB).
 
 **Option A — ModelScope (recommended for users in China):**
 
@@ -55,7 +55,7 @@ python -c "
 from modelscope import snapshot_download
 snapshot_download('facebook/sam3', cache_dir='checkpoints')
 "
-# Then copy the .pt file to checkpoints/sam3.pt
+# Copy the .pt file to checkpoints/sam3.pt
 ```
 
 **Option B — HuggingFace:**
@@ -68,11 +68,12 @@ hf_hub_download('facebook/sam3', 'sam3.pt', local_dir='checkpoints')
 "
 ```
 
-The directory should look like:
+Expected layout:
 
 ```
 checkpoints/
-└── sam3.pt    (~3.4 GB)
+├── sam3.pt         (~3.4 GB, SAM 3 model)
+└── simopa.pth      (~45 MB, simOPA scorer — auto-copied from project/)
 ```
 
 ---
@@ -88,12 +89,10 @@ checkpoints/
 
 ### 2. Configure `.env`
 
-Edit `OpenSplice/.env`:
-
 ```bash
 QWEN_IMAGE_API_KEY=sk-your-api-key-here
-QWEN_IMAGE_MODEL=qwen-image-plus
-QWEN_IMAGE_EDIT_MODEL=qwen-image-edit-max
+QWEN_IMAGE_MODEL=qwen-image-plus          # or z-image-turbo
+QWEN_IMAGE_EDIT_MODEL=qwen-image-edit-max # or qwen-image-edit-plus
 
 SAM3_CHECKPOINT=checkpoints/sam3.pt
 SAM3_DEVICE=cpu
@@ -105,28 +104,42 @@ OUTPUT_DIR=./outputs
 
 ## Usage
 
-### OpenSplice Web UI (full stitching)
+### OpenSplice Web UI
 
 ```bash
 python -m image_stitch_agent.app
 # Open http://127.0.0.1:7860
 ```
 
-**Workflow:**
+Two tabs:
 
-1. **Upload image** (file or webcam)
-2. **Segment** an object using text prompt, box drag, or point clicks
-3. **Select mask** if multiple results
-4. **Provide replacement** — upload an image or generate one via AI
-5. **Stitch:**
-   - **Fast Stitch** — Poisson blend only (local, no API)
-   - **Pose-Adapt & Stitch** — Poisson blend + AI harmonization (calls API)
+**Tab 1 — Interactive Placement:** free-form drag, rotate, scale
+
+1. Upload background image
+2. Upload or AI-generate a foreground image (auto-segmented via SAM 3 center point)
+3. Click on the preview canvas to position the foreground
+4. Adjust rotation (-180° to 180°) and scale (0.1× to 3.0×) with sliders
+5. Blend:
+   - **Alpha Blend** — direct pixel copy (fastest, hard edges)
+   - **Fast Blend (Poisson)** — gradient-domain seamless cloning
+   - **AI Harmonize** — Poisson blend + DashScope AI in-place fix
+6. Optional: **Color Transfer (Reinhard)** to match foreground colors to background
+7. Optional: **Score Naturalness (simOPA)** to evaluate compositing quality
+
+**Tab 2 — SAM3 Stitch:** segment → replace → stitch
+
+1. Upload image (file or webcam)
+2. Segment an object using text prompt, box drag, or point clicks
+3. Select mask if multiple results
+4. Provide replacement — upload an image or generate via AI
+5. Stitch:
+   - **Fast Stitch** — Poisson blend with auto object extraction
+   - **Pose-Adapt & Stitch** — Fast stitch + AI harmonization
 
 ### SAM 3 Demo (segmentation only)
 
 ```bash
 python sam3_demo.py
-# Open http://127.0.0.1:7860
 ```
 
 Supports text, box, and point prompts. No stitching — just segmentation visualization.
@@ -137,59 +150,26 @@ Supports text, box, and point prompts. No stitching — just segmentation visual
 
 ```
 OpenSplice/
-├── image_stitch_agent/          # Main package
+├── image_stitch_agent/
 │   ├── __init__.py
-│   ├── config.py                # Loads .env settings
+│   ├── config.py                # .env loader
 │   ├── segmenter.py             # SAM 3 wrapper (text/box/point)
-│   ├── stitcher.py              # Poisson blending + crop_to_object
+│   ├── stitcher.py              # Poisson blend, crop_to_object
+│   ├── transforms.py            # Rotation, scale, overlay, place_and_blend, alpha_place
 │   ├── image_gen_client.py      # DashScope APIs (generate, harmonize)
-│   └── app.py                   # Gradio Web UI
-├── sam3_demo.py                 # Standalone SAM 3 segmentation demo
-├── checkpoints/                 # SAM 3 model weights (not in git)
-│   └── sam3.pt
-├── outputs/                     # Generated results (not in git)
-├── .env                         # API keys and config (not in git)
-├── .gitignore
-├── requirements_agent.txt       # Python dependencies
-└── README.md
-```
-
----
-
-## How It Works
-
-```
-Input Image
-    │
-    ▼
-┌─────────────────────┐
-│ 1. Segment           │  SAM 3 — text / box / point prompts
-│    SAM 3             │  → Binary mask + score + bbox
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│ 2. Replacement       │  Upload image OR generate via Qwen-Image-Plus
-│    Upload / Generate │  → RGB image
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│ 3. Extract Object    │  Canny edge detection + contours
-│    crop_to_object()  │  → Cropped to subject (no background)
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│ 4. Poisson Blend     │  Resize → Place at mask bbox → seamlessClone
-│    cv2.seamlessClone │  → Rough composite (Fast Stitch output)
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│ 5. Harmonize (opt.)  │  Qwen-Image-Edit fixes lighting/seams/scale
-│    AI Image Edit     │  → Natural-looking final composite
-└─────────────────────┘
+│   ├── libcom_utils.py          # Reinhard color transfer + simOPA bridge
+│   ├── opa_scorer.py            # Self-contained simOPA scorer (CPU, no libcom dep)
+│   └── app.py                   # Gradio Web UI (two tabs)
+├── sam3_demo.py                 # Standalone SAM 3 demo
+├── test_segmentation.py         # CLI SAM 3 test
+├── checkpoints/
+│   ├── sam3.pt                  # SAM 3 weights (~3.4 GB)
+│   └── simopa.pth               # simOPA weights (~45 MB)
+├── outputs/                     # Result images
+├── .env                         # API keys and config
+├── requirements_agent.txt
+├── README.md
+└── Method.md
 ```
 
 ---
@@ -198,11 +178,24 @@ Input Image
 
 | File | Description |
 |------|-------------|
-| `outputs/last_fast.png` | Fast Stitch result (Poisson blend only) |
-| `outputs/last_result.png` | AI-harmonized result (Pose-Adapt & Stitch) |
-| `outputs/last_generated.png` | Most recent AI-generated replacement |
-| `outputs/last_harmonized.png` | Debug: raw harmonization API output |
-| `outputs/last_pose_adapted.png` | Debug: raw pose adaptation API output |
+| `outputs/last_placement_alpha.png` | Tab 1 Alpha Blend result |
+| `outputs/last_placement_fast.png` | Tab 1 Poisson blend result |
+| `outputs/last_placement_harmonized.png` | Tab 1 AI harmonized result |
+| `outputs/last_placement_colortransfer.png` | Tab 1 Reinhard color transfer result |
+| `outputs/last_fast.png` | Tab 2 Fast Stitch result |
+| `outputs/last_result.png` | Tab 2 AI-harmonized result |
+| `outputs/last_generated.png` | Most recent AI-generated image |
+
+---
+
+## Models
+
+| Model | Where | Purpose |
+|-------|-------|---------|
+| SAM 3 (848M) | `checkpoints/sam3.pt` | Segmentation (text/box/point) |
+| simOPA (~11M) | `checkpoints/simopa.pth` | Composition naturalness scoring |
+| Qwen-Image-Plus | DashScope API | AI image generation |
+| Qwen-Image-Edit-Max | DashScope API | AI image harmonization |
 
 ---
 
@@ -210,21 +203,21 @@ Input Image
 
 ### SAM 3 checkpoint not found
 
-Make sure `sam3.pt` exists at `checkpoints/sam3.pt`. See [Download SAM 3 checkpoint](#4-download-sam-3-checkpoint).
+Make sure `sam3.pt` exists at `checkpoints/sam3.pt`.
 
 ### DashScope API errors
 
-- Check `QWEN_IMAGE_API_KEY` in `.env` is correct
-- Check model quota — switch models in `.env` if quota exhausted (`qwen-image-plus` ↔ `z-image-turbo`, `qwen-image-edit-max` ↔ `qwen-image-edit-plus`)
+- Check `QWEN_IMAGE_API_KEY` in `.env`
+- If quota exhausted, switch models in `.env` (e.g., `qwen-image-plus` ↔ `z-image-turbo`)
 
-### Stitch result looks unchanged
+### Scale/Rotation shows no effect
 
-The mask threshold was fixed. Make sure you're running the latest code — older versions had `mask_blurred > 128` instead of `mask_blurred > 0.5`.
+Fixed — SAM masks are binary (0/1), thresholding now correctly handles this.
 
-### Slow first segmentation
+### simOPA scoring unavailable
 
-SAM 3 loads on first use (~45s CPU). Subsequent segmentations use the cached model. Set `SAM3_DEVICE=cuda` in `.env` if you have a GPU.
+Check `checkpoints/simopa.pth` exists. If not, copy from `project/OPA/eval_opascore/checkpoints/simopa.pth`.
 
-### Content safety filters
+### Slow first run
 
-DashScope applies safety filters. Rephrase prompts to avoid sensitive terms if generation is blocked.
+SAM 3 loads on first use (~45s CPU). Subsequent calls use the cached model. Set `SAM3_DEVICE=cuda` if you have a GPU.
