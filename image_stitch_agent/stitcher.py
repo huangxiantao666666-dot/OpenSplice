@@ -64,7 +64,7 @@ def poisson_blend(
     foreground: np.ndarray,
     mask: np.ndarray,
     center: Optional[tuple[int, int]] = None,
-    blend_mode: int = cv2.NORMAL_CLONE,
+    blend_mode: int = cv2.MIXED_CLONE,
 ) -> np.ndarray:
     """
     Blend foreground onto background using Poisson image editing.
@@ -104,19 +104,43 @@ def poisson_blend(
     fg_full = background.copy()
     fg_full[y:y + h, x:x + w] = fg_resized
 
-    # Use the precise mask contour so only the object region is blended.
-    # smooth the mask edges slightly for a cleaner seam.
-    # SAM masks are binary (0/1), so threshold at 0.5 after blur
-    mask_blurred = cv2.GaussianBlur(mask.astype(np.float32), (5, 5), 0)
-    mask_uint8 = (mask_blurred > 0.5).astype(np.uint8) * 255
+    mask_full = np.zeros(background.shape[:2], dtype=np.float32)
+    mask_full[y:y + h, x:x + w] = mask[y:y + h, x:x + w].astype(np.float32)
 
+    if mask_full.sum() < 1:
+        return background.copy()
+
+    if blend_mode < 0:  # negative = feathered alpha blend (uses precise mask)
+        feather = max(3, min(w, h) // 20)
+        mask_feathered = cv2.GaussianBlur(mask_full, (feather*2+1, feather*2+1), 0)
+        mask_3ch = np.stack([mask_feathered] * 3, axis=-1)
+        result = (fg_full.astype(np.float32) * mask_3ch +
+                  background.astype(np.float32) * (1 - mask_3ch)).astype(np.uint8)
+        return result
+
+    # Poisson blend via seamlessClone:
+    # Step 1: use a FULL RECTANGULAR mask — gives the solver complete gradient info.
+    # Step 2: after blending, cut out only the object region with the precise SAM mask
+    #         so background pixels from the foreground image don't appear in the output.
+    if center is None:
+        center = (x + w // 2, y + h // 2)
+    rect_mask = np.zeros(background.shape[:2], dtype=np.uint8)
+    rect_mask[y:y + h, x:x + w] = 255
     try:
-        result = cv2.seamlessClone(
-            fg_full, background, mask_uint8, center, blend_mode
-        )
+        blended = cv2.seamlessClone(fg_full, background, rect_mask, center, blend_mode)
+        # Cut out only the object (feathered edges on the precise mask)
+        feather = max(3, min(w, h) // 20)
+        mask_feathered = cv2.GaussianBlur(mask_full, (feather*2+1, feather*2+1), 0)
+        mask_3ch = np.stack([mask_feathered] * 3, axis=-1)
+        result = (blended.astype(np.float32) * mask_3ch +
+                  background.astype(np.float32) * (1 - mask_3ch)).astype(np.uint8)
     except cv2.error as e:
-        logger.warning("seamlessClone failed: %s. Falling back to simple alpha blend.", e)
-        result = _alpha_blend(background, fg_full, mask_uint8)
+        logger.warning("seamlessClone failed: %s", e)
+        feather = max(3, min(w, h) // 20)
+        mask_feathered = cv2.GaussianBlur(mask_full, (feather*2+1, feather*2+1), 0)
+        mask_3ch = np.stack([mask_feathered] * 3, axis=-1)
+        result = (fg_full.astype(np.float32) * mask_3ch +
+                  background.astype(np.float32) * (1 - mask_3ch)).astype(np.uint8)
 
     return result
 

@@ -199,6 +199,45 @@ OpenSplice/
 
 ---
 
+## Distribution
+
+### Option A: PyInstaller Standalone .exe
+
+Build a single `.exe` file (~300 MB). Double-click to run — pretrained weights auto-download on first launch.
+
+```bash
+pip install pyinstaller
+python build_exe.py
+# Output: dist/OpenSplice.exe
+```
+
+Share `OpenSplice.exe` + `.env`（with API key）. The recipient needs:
+- Windows 10/11
+- No Python required
+- ~15 GB free disk space (for SAM3 checkpoint + PyTorch extraction)
+- Internet connection (first run downloads SAM3 from HuggingFace/ModelScope)
+
+### Option B: HuggingFace Spaces
+
+Free hosting, zero download for users. Deploy to [huggingface.co/spaces](https://huggingface.co/spaces):
+
+1. Create a new Space with Gradio SDK
+2. Push the `image_stitch_agent/` folder + `checkpoints/` + `requirements_agent.txt`
+3. Set `QWEN_IMAGE_API_KEY` as a Space secret
+
+### Option C: Gradio Share Link
+
+Temporary public link from your machine:
+
+```python
+# In app.py, change launch() to:
+ui.launch(share=True)
+```
+
+Anyone with the link can use your running instance.
+
+---
+
 ## Troubleshooting
 
 ### SAM 3 checkpoint not found

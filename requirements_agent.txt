@@ -9,3 +9,7 @@ Pillow>=9.4.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 dashscope>=1.17.0
+huggingface_hub>=0.20.0
+
+# Optional: for building standalone .exe
+# pyinstaller>=6.0.0

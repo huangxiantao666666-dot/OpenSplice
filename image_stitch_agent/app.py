@@ -193,7 +193,7 @@ def tab1_on_scale(val):
     return preview, status
 
 
-def tab1_fast_blend():
+def tab1_fast_blend(blend_choice: str):
     """Poisson blend foreground at current position/transform."""
     bg = _s1["bg_image"]
     fg = _s1["fg_image"]
@@ -201,27 +201,29 @@ def tab1_fast_blend():
     px = _s1["place_x"]
     py = _s1["place_y"]
 
-    if bg is None:
-        return None, "No background."
-    if fg is None:
-        return None, "No foreground."
-    if px is None:
-        return None, "Click on the preview to set position."
+    if bg is None: return None, "No background."
+    if fg is None: return None, "No foreground."
+    if px is None: return None, "Click on the preview to set position."
+
+    # Map UI label → blend_mode (negative = feathered alpha, positive = cv2 constant)
+    mode_map = {
+        "Feathered Alpha":         -1,
+        "Poisson (Mixed Clone)":   cv2.MIXED_CLONE,
+        "Poisson (Normal Clone)":  cv2.NORMAL_CLONE,
+    }
+    blend_mode = mode_map.get(blend_choice, -1)  # default: feathered alpha
 
     try:
         result = place_and_blend(
             bg, fg, fm, px, py,
             _s1["rotation"], _s1["scale"],
+            blend_mode=blend_mode,
         )
         _s1["blend_result"] = result
         out = str(OUTPUT_DIR / "last_placement_fast.png")
         cv2.imwrite(out, cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
-        print(f"[DEBUG] Tab1 FastBlend done: {out}")
-        return result, f"Done: {out}"
+        return result, f"Done ({blend_choice}): {out}"
     except Exception as e:
-        print(f"[DEBUG] Tab1 FastBlend ERROR: {e}")
-        import traceback
-        traceback.print_exc()
         return None, f"Error: {e}"
 
 
@@ -634,10 +636,24 @@ def build_ui():
                         gr.HTML("</div>")
 
                         gr.HTML('<div class="section"><h3>Blend</h3>')
+                        blend_mode_radio = gr.Radio(
+                            choices=[
+                                "Feathered Alpha",
+                                "Poisson (Mixed Clone)",
+                                "Poisson (Normal Clone)",
+                            ],
+                            value="Feathered Alpha",
+                            label="Blend mode",
+                        )
                         with gr.Row():
-                            alpha_blend_btn = gr.Button("Alpha Blend", variant="secondary")
-                            fast_blend_btn = gr.Button("Fast Blend (Poisson)", variant="primary")
+                            alpha_blend_btn = gr.Button("Alpha Blend (Hard)", variant="secondary")
+                            fast_blend_btn = gr.Button("Blend", variant="primary")
                         ai_harmonize_btn = gr.Button("AI Harmonize", variant="secondary")
+                        gr.Markdown(
+                            "*Feathered Alpha*: keep foreground colors, smooth edges only. "
+                            "*Mixed Clone*: match color + texture. "
+                            "*Normal Clone*: match color, keep fg texture."
+                        )
                         gr.HTML("</div>")
 
                         # Color adjustment section
@@ -669,7 +685,7 @@ def build_ui():
                 scale_slider.change(tab1_on_scale, [scale_slider], [live_preview, status1])
 
                 alpha_blend_btn.click(tab1_alpha_blend, [], [blend_result1, status1])
-                fast_blend_btn.click(tab1_fast_blend, [], [blend_result1, status1])
+                fast_blend_btn.click(tab1_fast_blend, [blend_mode_radio], [blend_result1, status1])
                 ai_harmonize_btn.click(tab1_ai_harmonize, [], [blend_result1, status1])
 
                 color_xfer_btn.click(tab1_color_transfer, [], [blend_result1, status1])
